@@ -48,6 +48,7 @@ PROXY_FILE_DEFAULT = "proxies.txt"
 CONCURRENCY = 1                 # single worker -> single sticky proxy
 DEFAULT_DELAY = 1.5             # seconds between checks
 MIN_WEBHOOK_GAP = 0.45          # ~2.2 embeds/s, under Discord's 5/2s limit
+REFRESH_INTERVAL = 600          # seconds between background proxy refreshes
 
 LETTERS = string.ascii_lowercase
 DIGITS = string.digits
@@ -326,6 +327,33 @@ async def hunt(cfg: dict) -> None:
             cur_proxy = None
             print(f"  rate-limited {burned or 'proxy'} -> switching to #{proxy_idx}")
 
+        async def proxy_refresher() -> None:
+            """Every REFRESH_INTERVAL seconds: scrape + validate new proxies
+            and merge them into the live rotation."""
+            known = set(proxies)
+            while True:
+                await asyncio.sleep(REFRESH_INTERVAL)
+                try:
+                    raw = await scrape_proxies(session)
+                    good = await validate_proxies(session, raw)
+                    fresh = [p for p in good if p not in known]
+                    if fresh:
+                        known.update(fresh)
+                        proxies.extend(fresh)
+                        for p in fresh:
+                            append_line(cfg["proxy_file"], p)
+                        print(f"\n  [refresher] +{len(fresh)} new validated proxies "
+                              f"(pool: {len(proxies)})\n")
+                    else:
+                        print("  [refresher] no new working proxies found")
+                except Exception as e:
+                    print(f"  [refresher] error: {e}")
+
+        refresh_task = None
+        if cfg.get("auto_refresh") and proxies:
+            refresh_task = asyncio.create_task(proxy_refresher())
+            print(f"background proxy refresher: on (every {REFRESH_INTERVAL // 60} min)")
+
         async def worker() -> None:
             nonlocal proxy_idx
             while True:
@@ -425,6 +453,12 @@ def wizard() -> dict:
         if not Path(proxy_file).exists():
             print(f"  '{proxy_file}' not found — falling back to free scrape")
             proxy_mode = "1"
+    auto_refresh = "n"
+    if proxy_mode in ("1", "2"):
+        auto_refresh = ask_choice(
+            "keep hunting for fresh proxies in the background while checking?",
+            {"y": "yes — auto-refresh the proxy pool every 10 min",
+             "n": "no — use only the starting pool"}, "y")
 
     print("\n— usernames —")
     length = int(ask_int("username length (2-5 — Discord's minimum is 2; "
@@ -477,6 +511,7 @@ def wizard() -> dict:
         "names_file": names_file,
         "proxy_mode": proxy_mode,
         "proxy_file": proxy_file,
+        "auto_refresh": auto_refresh == "y",
         "webhook_success": wh_success or None,
         "webhook_fail": wh_fail or None,
         "delay": delay,

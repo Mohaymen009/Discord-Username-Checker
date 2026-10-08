@@ -39,6 +39,9 @@ The wizard walks you through everything:
   * 1) scrape free proxies + auto-validate (no setup)
     2) load from my own file (one host:port per line)
     3) no proxies (your own IP — expect rate limits)
+  keep hunting for fresh proxies in the background while checking?
+  * y) yes — auto-refresh the proxy pool every 10 min
+    n) no — use only the starting pool
 
 — usernames —
   username length (2-5 — Discord's minimum is 2; shorter = nearly all taken) [4]:
@@ -78,6 +81,14 @@ The wizard walks you through everything:
 
 Free proxies are validated by making a real availability request through each
 one — only proxies that answer correctly enter rotation.
+
+## 🔄 Background proxy refresher
+
+Answer **yes** to "keep hunting for fresh proxies" and the checker spawns a
+background task that, every 10 minutes, re-scrapes the public proxy lists,
+validates the newcomers against Discord, and merges survivors straight into
+the live rotation (and `proxies.txt`). Dead pools refill themselves while you
+keep checking — no restart needed.
 
 ## 📡 Webhook embeds
 
