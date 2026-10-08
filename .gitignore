@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 config.json
-checked.txt
 hits.txt
 proxies.txt
 names.txt
