@@ -308,6 +308,7 @@ async def hunt(cfg: dict) -> None:
         stats = {"checked": 0, "free": 0}
         proxy_idx = 0
         cur_proxy: str | None = None
+        strikes: dict[str, int] = {}   # proxy -> rate-limit strike count
         refill = asyncio.Event()
         refill.set()  # need names immediately
 
@@ -320,9 +321,23 @@ async def hunt(cfg: dict) -> None:
             return cur_proxy
 
         def switch_proxy(burned: str | None) -> None:
+            """Rate-limited proxy: strikes 1-2 get retried on a later loop;
+            strike 3 removes it from rotation (and proxies.txt) for good."""
             nonlocal proxy_idx, cur_proxy
             if not proxies:
                 return
+            if burned:
+                strikes[burned] = strikes.get(burned, 0) + 1
+                if strikes[burned] >= 3:
+                    proxies.remove(burned)
+                    strikes.pop(burned, None)
+                    if cfg.get("proxy_file"):
+                        Path(cfg["proxy_file"]).write_text(
+                            "\n".join(proxies) + "\n", encoding="utf-8")
+                    print(f"  removed dead proxy {burned} "
+                          f"(3 strikes, {len(proxies)} left)")
+                    if not proxies:
+                        return
             proxy_idx = (proxy_idx + 1) % len(proxies)
             cur_proxy = None
             print(f"  rate-limited {burned or 'proxy'} -> switching to #{proxy_idx}")
@@ -380,6 +395,7 @@ async def hunt(cfg: dict) -> None:
                         headers={"Content-Type": "application/json"},
                     ) as resp:
                         if resp.status == 200:
+                            strikes.pop(proxy, None)  # healthy again
                             if '"taken":false' in await resp.text():
                                 status = "free"
                                 stats["free"] += 1
