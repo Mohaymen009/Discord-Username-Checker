@@ -188,21 +188,33 @@ async def validate_proxies(session: aiohttp.ClientSession, proxies: list[str],
 # Username generator
 # ---------------------------------------------------------------------------
 
-def gen_names(count: int, mode: str, checked: set[str]) -> list[str]:
-    """mode: '4digit' (4 chars, >=1 digit), '3letter' (3 letters), '4letter'."""
+def gen_names(count: int, length: int, comp: str, checked: set[str]) -> list[str]:
+    """comp: 'letters', 'digits', 'mix' (>=1 of each),
+    'oneletter' (exactly 1 letter, rest digits),
+    'onedigit' (exactly 1 digit, rest letters), 'anything'."""
     rng = random.Random()
     out: set[str] = set()
+    guard = 0
     while len(out) < count:
-        if mode == "4digit":
-            name = "".join(rng.choice(ALL_CHARS) for _ in range(4))
-            if not any(c in DIGITS for c in name):
-                continue  # pure letters are effectively all taken
-        elif mode == "3letter":
-            name = "".join(rng.choice(LETTERS) for _ in range(3))
-        else:
-            name = "".join(rng.choice(LETTERS) for _ in range(4))
-        if name not in checked:
-            out.add(name)
+        guard += 1
+        if guard > count * 2000:   # pattern space exhausted
+            break
+        name = "".join(rng.choice(ALL_CHARS) for _ in range(length))
+        n_let = sum(c in LETTERS for c in name)
+        n_dig = length - n_let
+        if comp == "letters" and n_dig:
+            continue
+        if comp == "digits" and n_let:
+            continue
+        if comp == "mix" and (not n_let or not n_dig):
+            continue
+        if comp == "oneletter" and n_let != 1:
+            continue
+        if comp == "onedigit" and n_dig != 1:
+            continue
+        if name in checked:
+            continue
+        out.add(name)
     return list(out)
 
 
@@ -273,7 +285,8 @@ class Reporter:
 
 async def hunt(cfg: dict) -> None:
     delay = cfg["delay"]
-    mode = cfg["name_mode"]
+    length = cfg["length"]
+    comp = cfg["comp"]
     names_file = cfg.get("names_file", "")
     batch_size = 500
 
@@ -321,7 +334,7 @@ async def hunt(cfg: dict) -> None:
                         pool = load_set(names_file) - checked
                         batch = list(pool)[:batch_size]
                     else:
-                        batch = gen_names(batch_size, mode, checked)
+                        batch = gen_names(batch_size, length, comp, checked)
                     if not batch:
                         print("no new usernames to check — done.")
                         await asyncio.sleep(5)
@@ -367,7 +380,7 @@ async def hunt(cfg: dict) -> None:
                 if work.empty():
                     refill.set()
 
-        print(f"\nhunting {mode} usernames — ctrl+c to stop\n")
+        print(f"\nhunting {length}-char [{comp}] usernames — ctrl+c to stop\n")
         try:
             await worker()
         except asyncio.CancelledError:
@@ -382,7 +395,8 @@ def wizard() -> dict:
     cfg = load_config()
     if cfg:
         reuse = ask_choice(
-            f"found saved settings ({cfg.get('name_mode', '?')}, delay {cfg.get('delay', '?')}s) — use them?",
+            f"found saved settings ({cfg.get('length', '?')}-char {cfg.get('comp', '?')}, "
+            f"delay {cfg.get('delay', '?')}s) — use them?",
             {"y": "use saved settings", "n": "run setup again"}, "y")
         if reuse == "y":
             return cfg
@@ -413,15 +427,25 @@ def wizard() -> dict:
             proxy_mode = "1"
 
     print("\n— usernames —")
-    name_mode = ask_choice(
-        "what kind of usernames?",
-        {"1": "4 characters, letters+digits, at least one digit (best odds)",
-         "2": "3 letters (almost all taken — slow going)",
-         "3": "4 letters (almost all taken)",
-         "4": "load from my own file (one username per line)"},
-        "1")
+    length = int(ask_int("username length (2-5 — Discord's minimum is 2; "
+                         "shorter = nearly all taken)", 4))
+    length = min(max(length, 2), 5)
+    comp_key = ask_choice(
+        "what should the usernames be made of?",
+        {"1": "all letters (e.g. qwer)",
+         "2": "all numbers (e.g. 1337)",
+         "3": "any mix of letters and digits, at least one of each (e.g. a1b2)",
+         "4": "mix with exactly 1 letter, rest digits (e.g. 1a23)",
+         "5": "mix with exactly 1 digit, rest letters (e.g. ab1c)",
+         "6": "anything (letters, digits, any combination)"},
+        "3" if length >= 3 else "6")
+    comp = {"1": "letters", "2": "digits", "3": "mix",
+            "4": "oneletter", "5": "onedigit", "6": "anything"}[comp_key]
+    use_file = ask_choice(
+        "or load usernames from your own file instead of generating?",
+        {"y": "load from file", "n": "generate"}, "n")
     names_file = ""
-    if name_mode == "4":
+    if use_file == "y":
         names_file = ask("usernames file path", "names.txt")
 
     print("\n— webhooks —")
@@ -448,7 +472,8 @@ def wizard() -> dict:
     delay = ask_int("delay between checks in seconds", DEFAULT_DELAY)
 
     cfg = {
-        "name_mode": {"1": "4digit", "2": "3letter", "3": "4letter"}.get(name_mode, "file"),
+        "length": length,
+        "comp": comp,
         "names_file": names_file,
         "proxy_mode": proxy_mode,
         "proxy_file": proxy_file,

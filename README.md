@@ -41,10 +41,14 @@ The wizard walks you through everything:
     3) no proxies (your own IP — expect rate limits)
 
 — usernames —
-  * 1) 4 characters, letters+digits, at least one digit (best odds)
-    2) 3 letters (almost all taken — slow going)
-    3) 4 letters (almost all taken)
-    4) load from my own file (one username per line)
+  username length (2-5 — Discord's minimum is 2; shorter = nearly all taken) [4]:
+  what should the usernames be made of?
+  * 1) all letters (e.g. qwer)
+    2) all numbers (e.g. 1337)
+    3) any mix of letters and digits, at least one of each (e.g. a1b2)
+    4) mix with exactly 1 letter, rest digits (e.g. 1a23)
+    5) mix with exactly 1 digit, rest letters (e.g. ab1c)
+    6) anything (letters, digits, any combination)
 
 — webhooks —
   * 1) success only (free usernames)
