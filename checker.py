@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-Discord Username Checker — tokenless availability hunter.
+Discord Username Checker: find available usernames, no token or login needed.
 
-Finds available Discord usernames by checking Discord's public
-unique-username endpoint. No token, no login, no captcha.
+Just run it:            python checker.py
+Change the settings:    python checker.py --setup
+See all options:        python checker.py --help
 
-Features:
-  - Interactive setup wizard (resume, proxies, webhooks, pacing)
-  - Username generator: 4-char letter/digit mixes, 3-letter, or your own file
-  - Sticky proxy rotation: one proxy at a time, switch on rate-limit,
-    round-robin back to the first after the last
-  - Never checks the same username twice (checked.txt)
-  - Every check (success AND fail) reported to Discord via embeds
-  - Saves hits to hits.txt
+It checks Discord's public sign-up endpoint, remembers every name it has already
+checked, and saves free names to hits.txt. It never logs in and cannot claim a
+name for you; when it finds a free one, you go claim it.
 
-Educational purposes only — don't spam Discord's API.
+Educational use only. Respect Discord's rate limits.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
 import random
 import re
 import string
@@ -31,546 +29,496 @@ from pathlib import Path
 try:
     import aiohttp
 except ImportError:
-    sys.exit("missing dependency: pip install aiohttp")
+    sys.exit("Missing dependency. Run:  pip install aiohttp   (or double-click run.bat)")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+VERSION = "2.0.0"
+ENDPOINT = os.environ.get(
+    "DUC_ENDPOINT", "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
+)
+HOME = Path(os.environ.get("DUC_HOME") or Path(__file__).resolve().parent)
+CHECKED_FILE = HOME / "checked.txt"
+HITS_FILE = HOME / "hits.txt"
+CONFIG_FILE = HOME / "config.json"
+PROXY_FILE = HOME / "proxies.txt"
 
-VERSION = "1.0.0"
-ENDPOINT = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
+SPEEDS = {"safe": 2.0, "normal": 1.2, "fast": 0.6}   # seconds between checks
+KINDS = {"mix": "letters and numbers mixed", "letters": "letters only",
+         "digits": "numbers only", "any": "anything"}
+DEFAULTS = {"length": 4, "kind": "mix", "speed": "safe", "proxies": "none",
+            "proxy_file": "", "names_file": "", "webhook": ""}
 
-CHECKED_FILE = "checked.txt"
-HITS_FILE = "hits.txt"
-CONFIG_FILE = "config.json"
-PROXY_FILE_DEFAULT = "proxies.txt"
-
-CONCURRENCY = 1                 # single worker -> single sticky proxy
-DEFAULT_DELAY = 1.5             # seconds between checks
-MIN_WEBHOOK_GAP = 0.45          # ~2.2 embeds/s, under Discord's 5/2s limit
-REFRESH_INTERVAL = 600          # seconds between background proxy refreshes
-
-LETTERS = string.ascii_lowercase
-DIGITS = string.digits
-ALL_CHARS = LETTERS + DIGITS
-
-GREEN, RED, ORANGE, GRAY = 0x30D158, 0xFF453A, 0xFF9F0A, 0x98989D
-
+MAX_ATTEMPTS = 6        # tries per name before it is skipped (and NOT marked as checked)
+MAX_STRIKES = 3         # failures before a proxy is dropped
+FREE_PROXY_SAMPLE = 4000
+LETTERS, DIGITS = string.ascii_lowercase, string.digits
+NAME_RE = re.compile(r"^[a-z0-9._]{2,32}$")
+PROXY_RE = re.compile(r"^(?:https?://)?(?:[^@\s]+@)?[a-zA-Z0-9][a-zA-Z0-9\-.]*:\d{1,5}$")
 PROXY_SOURCES = [
-    ("TheSpeedX", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
-    ("monosans", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
-    ("proxifly", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
-    ("roosterkid", "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt"),
-    ("openproxylist", "https://api.openproxylist.xyz/http.txt"),
-    ("proxyscrape", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all"),
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
 ]
-PROXY_RE = re.compile(r"^(?:https?://)?(?:[^@\s]+@)?[a-zA-Z0-9](?:[a-zA-Z0-9\-.]*[a-zA-Z0-9])?:\d{1,5}$")
-
-BANNER = f"""
-  ┌─────────────────────────────────────────┐
-  │   Discord Username Checker  v{VERSION}   │
-   │   tokenless · async · embeds reports  │
-    └───────────────────────────────────────┘
-"""
-
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Files and settings
 # ---------------------------------------------------------------------------
 
-def ask(prompt: str, default: str = "") -> str:
-    suffix = f" [{default}]" if default else ""
-    val = input(f"{prompt}{suffix}: ").strip()
-    return val or default
 
-
-def ask_choice(prompt: str, options: dict[str, str], default: str) -> str:
-    """options maps key -> description. Returns the chosen key."""
-    print(f"\n{prompt}")
-    for key, desc in options.items():
-        marker = "*" if key == default else " "
-        print(f"  {marker} {key}) {desc}")
-    while True:
-        val = input(f"choice [{default}]: ").strip().lower() or default
-        if val in options:
-            return val
-        print("  invalid choice, try again")
-
-
-def ask_int(prompt: str, default: float) -> float:
-    val = ask(prompt, str(default))
+def load_set(path: Path) -> set[str]:
     try:
-        return max(0.1, float(val))
-    except ValueError:
-        return default
-
-
-def load_set(path: str) -> set[str]:
-    p = Path(path)
-    if not p.exists():
+        return {ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()}
+    except OSError:
         return set()
-    return {ln.strip() for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()}
 
 
-def append_line(path: str, line: str) -> None:
+def append_line(path: Path, line: str) -> None:
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
 def load_config() -> dict:
-    p = Path(CONFIG_FILE)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    try:
+        return {**DEFAULTS, **json.loads(CONFIG_FILE.read_text(encoding="utf-8"))}
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
 
 
 def save_config(cfg: dict) -> None:
-    Path(CONFIG_FILE).write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def describe(cfg: dict) -> str:
+    if cfg["names_file"]:
+        what = f"names from {cfg['names_file']}"
+    else:
+        what = f"{cfg['length']}-character names, {KINDS[cfg['kind']]}"
+    proxies = {"none": "no proxies", "free": "free proxies"}.get(cfg["proxies"], "your proxy file")
+    return f"{what} | {cfg['speed']} speed | {proxies}"
 
 
 # ---------------------------------------------------------------------------
-# Proxies: scrape + validate
+# Setup wizard (only runs with --setup)
 # ---------------------------------------------------------------------------
 
-async def scrape_proxies(session: aiohttp.ClientSession) -> list[str]:
-    print("\nscraping free proxy sources...")
-    raw: set[str] = set()
 
-    async def fetch(name: str, url: str) -> None:
-        try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    print(f"  x {name} (http {resp.status})")
-                    return
-                found = [p.strip() for p in (await resp.text()).splitlines()
-                         if PROXY_RE.match(p.strip())]
-                raw.update(found)
-                print(f"  + {name}: {len(found)} proxies")
-        except Exception as e:
-            print(f"  x {name} ({type(e).__name__})")
+def choose(title: str, options: list[str], default: int = 1) -> int:
+    print(f"\n{title}")
+    for i, text in enumerate(options, 1):
+        print(f"  {i}) {text}{'   <- recommended' if i == default else ''}")
+    while True:
+        raw = input(f"Choose 1-{len(options)} [{default}]: ").strip() or str(default)
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw)
+        print("  Please type one of the numbers above.")
 
-    await asyncio.gather(*(fetch(n, u) for n, u in PROXY_SOURCES))
-    print(f"  = {len(raw)} unique raw proxies")
-    return sorted(raw)
-
-
-async def validate_proxies(session: aiohttp.ClientSession, proxies: list[str],
-                           concurrency: int = 300, timeout: float = 10.0) -> list[str]:
-    """Test each proxy against the real endpoint; keep only working ones."""
-    print(f"validating {len(proxies)} proxies against Discord...")
-    sem = asyncio.Semaphore(concurrency)
-    working: list[str] = []
-    done = 0
-
-    async def test(proxy: str) -> None:
-        nonlocal done
-        async with sem:
-            try:
-                async with session.post(
-                    ENDPOINT, json={"username": "aa"}, proxy=proxy,
-                    headers={"Content-Type": "application/json"},
-                ) as resp:
-                    if resp.status == 200 and "taken" in await resp.text():
-                        working.append(proxy)
-            except Exception:
-                pass
-            done += 1
-            if done % 1000 == 0:
-                print(f"  tested {done}/{len(proxies)}, {len(working)} working")
-
-    await asyncio.gather(*(test(p) for p in proxies))
-    return working
-
-
-# ---------------------------------------------------------------------------
-# Username generator
-# ---------------------------------------------------------------------------
-
-def gen_names(count: int, length: int, comp: str, checked: set[str]) -> list[str]:
-    """comp: 'letters', 'digits', 'mix' (>=1 of each),
-    'oneletter' (exactly 1 letter, rest digits),
-    'onedigit' (exactly 1 digit, rest letters), 'anything'."""
-    rng = random.Random()
-    out: set[str] = set()
-    guard = 0
-    while len(out) < count:
-        guard += 1
-        if guard > count * 2000:   # pattern space exhausted
-            break
-        name = "".join(rng.choice(ALL_CHARS) for _ in range(length))
-        n_let = sum(c in LETTERS for c in name)
-        n_dig = length - n_let
-        if comp == "letters" and n_dig:
-            continue
-        if comp == "digits" and n_let:
-            continue
-        if comp == "mix" and (not n_let or not n_dig):
-            continue
-        if comp == "oneletter" and n_let != 1:
-            continue
-        if comp == "onedigit" and n_dig != 1:
-            continue
-        if name in checked:
-            continue
-        out.add(name)
-    return list(out)
-
-
-# ---------------------------------------------------------------------------
-# Webhook reporter: throttled embed queue
-# ---------------------------------------------------------------------------
-
-class Reporter:
-    def __init__(self, session: aiohttp.ClientSession,
-                 success_url: str | None, fail_url: str | None):
-        self.session = session
-        self.urls = {"success": success_url, "fail": fail_url}
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.last_sent = 0.0
-        if success_url or fail_url:
-            self.task = asyncio.create_task(self._worker())
-
-    async def _post(self, url: str, payload: dict) -> None:
-        try:
-            async with self.session.post(url, json=payload) as resp:
-                if resp.status == 429:
-                    data = await resp.json(content_type=None)
-                    await asyncio.sleep(float(data.get("retry_after", 2)))
-                    await self.session.post(url, json=payload)
-        except Exception:
-            pass
-
-    async def _worker(self) -> None:
-        while True:
-            item = await self.queue.get()
-            wait = self.last_sent + MIN_WEBHOOK_GAP - time.monotonic()
-            if wait > 0:
-                await asyncio.sleep(wait)
-            for url in item["urls"]:
-                await self._post(url, {"embeds": [item["embed"]]})
-            self.last_sent = time.monotonic()
-            self.queue.task_done()
-
-    def report(self, name: str, status: str, proxy: str | None) -> None:
-        if status == "free":
-            color, title, desc = GREEN, "AVAILABLE", f"**{name}** is free — claim it!"
-        elif status == "taken":
-            color, title, desc = RED, "Taken", f"**{name}** is already claimed."
-        else:
-            color, title, desc = ORANGE, "Notice", f"**{name}** — {status}"
-        url = self.urls["success" if status == "free" else "fail"]
-        if not url:
-            return
-        self.queue.put_nowait({
-            "urls": [url],
-            "embed": {
-                "title": title,
-                "description": desc,
-                "color": color,
-                "fields": [
-                    {"name": "Username", "value": name, "inline": True},
-                    {"name": "Proxy", "value": f"`{proxy or 'none'}`", "inline": True},
-                ],
-                "footer": {"text": "Discord Username Checker"},
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
-            },
-        })
-
-
-# ---------------------------------------------------------------------------
-# Engine: sticky round-robin proxy hunter
-# ---------------------------------------------------------------------------
-
-async def hunt(cfg: dict) -> None:
-    delay = cfg["delay"]
-    length = cfg["length"]
-    comp = cfg["comp"]
-    names_file = cfg.get("names_file", "")
-    batch_size = 500
-
-    checked = load_set(CHECKED_FILE)
-    print(f"\n{len(checked)} usernames already checked"
-          f"{' (resuming)' if checked else ''}")
-
-    proxies = [ln.strip() for ln in Path(cfg["proxy_file"]).read_text().splitlines()
-               if ln.strip()] if cfg.get("proxy_file") else []
-
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=12), trust_env=False,
-    ) as session:
-        reporter = Reporter(session, cfg.get("webhook_success"), cfg.get("webhook_fail"))
-        work: asyncio.Queue = asyncio.Queue()
-        hits_file = HITS_FILE
-        lock = asyncio.Lock()
-        stats = {"checked": 0, "free": 0}
-        proxy_idx = 0
-        cur_proxy: str | None = None
-        strikes: dict[str, int] = {}   # proxy -> rate-limit strike count
-        refill = asyncio.Event()
-        refill.set()  # need names immediately
-
-        def current_proxy() -> str | None:
-            nonlocal cur_proxy
-            if not proxies:
-                return None
-            if cur_proxy is None:
-                cur_proxy = proxies[proxy_idx]
-            return cur_proxy
-
-        def switch_proxy(burned: str | None) -> None:
-            """Rate-limited proxy: strikes 1-2 get retried on a later loop;
-            strike 3 removes it from rotation (and proxies.txt) for good."""
-            nonlocal proxy_idx, cur_proxy
-            if not proxies:
-                return
-            if burned:
-                strikes[burned] = strikes.get(burned, 0) + 1
-                if strikes[burned] >= 3:
-                    proxies.remove(burned)
-                    strikes.pop(burned, None)
-                    if cfg.get("proxy_file"):
-                        Path(cfg["proxy_file"]).write_text(
-                            "\n".join(proxies) + "\n", encoding="utf-8")
-                    print(f"  removed dead proxy {burned} "
-                          f"(3 strikes, {len(proxies)} left)")
-                    if not proxies:
-                        return
-            proxy_idx = (proxy_idx + 1) % len(proxies)
-            cur_proxy = None
-            print(f"  rate-limited {burned or 'proxy'} -> switching to #{proxy_idx}")
-
-        async def proxy_refresher() -> None:
-            """Every REFRESH_INTERVAL seconds: scrape + validate new proxies
-            and merge them into the live rotation."""
-            known = set(proxies)
-            while True:
-                await asyncio.sleep(REFRESH_INTERVAL)
-                try:
-                    raw = await scrape_proxies(session)
-                    good = await validate_proxies(session, raw)
-                    fresh = [p for p in good if p not in known]
-                    if fresh:
-                        known.update(fresh)
-                        proxies.extend(fresh)
-                        for p in fresh:
-                            append_line(cfg["proxy_file"], p)
-                        print(f"\n  [refresher] +{len(fresh)} new validated proxies "
-                              f"(pool: {len(proxies)})\n")
-                    else:
-                        print("  [refresher] no new working proxies found")
-                except Exception as e:
-                    print(f"  [refresher] error: {e}")
-
-        refresh_task = None
-        if cfg.get("auto_refresh") and proxies:
-            refresh_task = asyncio.create_task(proxy_refresher())
-            print(f"background proxy refresher: on (every {REFRESH_INTERVAL // 60} min)")
-
-        async def worker() -> None:
-            nonlocal proxy_idx
-            while True:
-                if refill.is_set():
-                    if names_file:
-                        pool = load_set(names_file) - checked
-                        batch = list(pool)[:batch_size]
-                    else:
-                        batch = gen_names(batch_size, length, comp, checked)
-                    if not batch:
-                        print("no new usernames to check — done.")
-                        await asyncio.sleep(5)
-                        continue
-                    for n in batch:
-                        work.put_nowait(n)
-                    refill.clear()
-
-                name = await work.get()
-                proxy = current_proxy()
-                status = "taken"
-                try:
-                    async with session.post(
-                        ENDPOINT, json={"username": name}, proxy=proxy,
-                        headers={"Content-Type": "application/json"},
-                    ) as resp:
-                        if resp.status == 200:
-                            strikes.pop(proxy, None)  # healthy again
-                            if '"taken":false' in await resp.text():
-                                status = "free"
-                                stats["free"] += 1
-                                append_line(hits_file, name)
-                                print(f"\n  *** FREE: {name} *** (saved to {hits_file})\n")
-                        elif resp.status == 429:
-                            switch_proxy(proxy)
-                            work.put_nowait(name)   # re-check on next proxy
-                            work.task_done()
-                            continue
-                        else:
-                            status = f"http {resp.status}"
-                except Exception:
-                    status = "connection error"
-
-                reporter.report(name, status, proxy)
-                async with lock:
-                    checked.add(name)
-                    append_line(CHECKED_FILE, name)
-                stats["checked"] += 1
-                if stats["checked"] % 25 == 0:
-                    print(f"  {stats['checked']} checked this session, "
-                          f"{stats['free']} free")
-                work.task_done()
-                await asyncio.sleep(delay)
-                if work.empty():
-                    refill.set()
-
-        print(f"\nhunting {length}-char [{comp}] usernames — ctrl+c to stop\n")
-        try:
-            await worker()
-        except asyncio.CancelledError:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# Wizard
-# ---------------------------------------------------------------------------
 
 def wizard() -> dict:
-    cfg = load_config()
-    if cfg:
-        reuse = ask_choice(
-            f"found saved settings ({cfg.get('length', '?')}-char {cfg.get('comp', '?')}, "
-            f"delay {cfg.get('delay', '?')}s) — use them?",
-            {"y": "use saved settings", "n": "run setup again"}, "y")
-        if reuse == "y":
-            return cfg
+    cfg = dict(DEFAULTS)
+    pick = choose("What kind of usernames do you want?", [
+        "4 characters, letters + numbers mixed (like a1b2)",
+        "3 letters (like abc)",
+        "4 letters (like abcd)",
+        "4 numbers (like 1234)",
+        "Names from my own file",
+        "Custom length and type",
+    ])
+    if pick == 1:
+        cfg.update(length=4, kind="mix")
+    elif pick == 2:
+        cfg.update(length=3, kind="letters")
+    elif pick == 3:
+        cfg.update(length=4, kind="letters")
+    elif pick == 4:
+        cfg.update(length=4, kind="digits")
+    elif pick == 5:
+        cfg["names_file"] = input("\nPath to your file (one name per line) [names.txt]: ").strip() or "names.txt"
+    else:
+        raw = input("\nLength, 2 to 6 [4]: ").strip() or "4"
+        cfg["length"] = min(max(int(raw) if raw.isdigit() else 4, 2), 6)
+        cfg["kind"] = ["mix", "letters", "digits", "any"][choose(
+            "Made of?", ["Letters and numbers mixed", "Letters only", "Numbers only", "Anything"]) - 1]
 
-    print("\n— checked usernames —")
-    resume = "n"
-    if Path(CHECKED_FILE).exists() and load_set(CHECKED_FILE):
-        resume = ask_choice(
-            f"{len(load_set(CHECKED_FILE))} usernames already checked",
-            {"y": "continue from where we left off (recommended)",
-             "n": "start over (wipes checked.txt)"}, "y")
-        if resume == "n":
-            Path(CHECKED_FILE).unlink()
-            print("  checked.txt wiped")
+    cfg["speed"] = ["safe", "normal", "fast"][choose("How fast?", [
+        "Safe: one check every 2 seconds, least likely to get blocked",
+        "Normal: one check every 1.2 seconds",
+        "Fast: one check every 0.6 seconds (works best with your own proxies)",
+    ]) - 1]
 
-    print("\n— proxies —")
-    proxy_mode = ask_choice(
-        "how do you want to get proxies?",
-        {"1": "scrape free proxies + auto-validate (no setup)",
-         "2": "load from my own file (one host:port per line)",
-         "3": "no proxies (your own IP — expect rate limits)"},
-        "1")
-    proxy_file = ""
-    if proxy_mode == "2":
-        proxy_file = ask("proxy file path", PROXY_FILE_DEFAULT)
-        if not Path(proxy_file).exists():
-            print(f"  '{proxy_file}' not found — falling back to free scrape")
-            proxy_mode = "1"
-    auto_refresh = "n"
-    if proxy_mode in ("1", "2"):
-        auto_refresh = ask_choice(
-            "keep hunting for fresh proxies in the background while checking?",
-            {"y": "yes — auto-refresh the proxy pool every 10 min",
-             "n": "no — use only the starting pool"}, "y")
+    p = choose("Proxies?", [
+        "No proxies (simple; if Discord slows you down, the tool just waits)",
+        "Free public proxies (slow to set up, unreliable, but can go faster)",
+        "My own proxy file (one host:port per line)",
+    ])
+    if p == 2:
+        cfg["proxies"] = "free"
+    elif p == 3:
+        cfg["proxies"] = "file"
+        cfg["proxy_file"] = input("\nPath to your proxy file [proxies.txt]: ").strip() or "proxies.txt"
 
-    print("\n— usernames —")
-    length = int(ask_int("username length (2-5 — Discord's minimum is 2; "
-                         "shorter = nearly all taken)", 4))
-    length = min(max(length, 2), 5)
-    comp_key = ask_choice(
-        "what should the usernames be made of?",
-        {"1": "all letters (e.g. qwer)",
-         "2": "all numbers (e.g. 1337)",
-         "3": "any mix of letters and digits, at least one of each (e.g. a1b2)",
-         "4": "mix with exactly 1 letter, rest digits (e.g. 1a23)",
-         "5": "mix with exactly 1 digit, rest letters (e.g. ab1c)",
-         "6": "anything (letters, digits, any combination)"},
-        "3" if length >= 3 else "6")
-    comp = {"1": "letters", "2": "digits", "3": "mix",
-            "4": "oneletter", "5": "onedigit", "6": "anything"}[comp_key]
-    use_file = ask_choice(
-        "or load usernames from your own file instead of generating?",
-        {"y": "load from file", "n": "generate"}, "n")
-    names_file = ""
-    if use_file == "y":
-        names_file = ask("usernames file path", "names.txt")
-
-    print("\n— webhooks —")
-    wh_mode = ask_choice(
-        "what should get reported to Discord webhooks?",
-        {"1": "success only (free usernames)",
-         "2": "fails only (taken usernames)",
-         "3": "both — separate success and fail webhooks",
-         "4": "single webhook for everything",
-         "5": "no webhooks (console only)"},
-        "1")
-    wh_success = wh_fail = None
-    if wh_mode == "1":
-        wh_success = ask("success webhook url")
-    elif wh_mode == "2":
-        wh_fail = ask("fail webhook url")
-    elif wh_mode == "3":
-        wh_success = ask("success webhook url")
-        wh_fail = ask("fail webhook url")
-    elif wh_mode == "4":
-        one = ask("webhook url")
-        wh_success = wh_fail = one
-
-    delay = ask_int("delay between checks in seconds", DEFAULT_DELAY)
-
-    cfg = {
-        "length": length,
-        "comp": comp,
-        "names_file": names_file,
-        "proxy_mode": proxy_mode,
-        "proxy_file": proxy_file,
-        "auto_refresh": auto_refresh == "y",
-        "webhook_success": wh_success or None,
-        "webhook_fail": wh_fail or None,
-        "delay": delay,
-    }
+    cfg["webhook"] = input("\nDiscord webhook URL to ping when a name is free (press Enter to skip): ").strip()
     save_config(cfg)
-    print(f"\nsettings saved to {CONFIG_FILE}")
+    print(f"\nSaved. Next time just run:  python checker.py\n")
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Name generation
 # ---------------------------------------------------------------------------
 
-async def main() -> None:
-    print(BANNER)
-    cfg = wizard()
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=15), trust_env=False,
-    ) as session:
-        # resolve proxies
-        if cfg["proxy_mode"] == "1":
-            path = Path(PROXY_FILE_DEFAULT)
-            if path.exists() and load_set(PROXY_FILE_DEFAULT):
-                reuse = ask_choice(
-                    f"{len(load_set(PROXY_FILE_DEFAULT))} cached proxies in {PROXY_FILE_DEFAULT}",
-                    {"y": "reuse them", "n": "scrape + validate fresh ones"}, "y")
-            else:
-                reuse = "n"
-            if reuse == "n":
-                raw = await scrape_proxies(session)
-                good = await validate_proxies(session, raw)
-                path.write_text("\n".join(good) + "\n")
-                print(f"  {len(good)} working proxies saved to {path}")
-            cfg["proxy_file"] = PROXY_FILE_DEFAULT
-        elif cfg["proxy_mode"] == "3":
-            cfg["proxy_file"] = ""
+def gen_names(count: int, length: int, kind: str, skip: set[str]) -> list[str]:
+    alphabet = {"letters": LETTERS, "digits": DIGITS}.get(kind, LETTERS + DIGITS)
+    rng = random.Random()
+    out: set[str] = set()
+    tries = 0
+    while len(out) < count and tries < count * 400:
+        tries += 1
+        name = "".join(rng.choice(alphabet) for _ in range(length))
+        if kind == "mix" and (name.isalpha() or name.isdigit()):
+            continue
+        if name not in skip:
+            out.add(name)
+    return list(out)
 
-    await hunt(cfg)
+
+def file_names(path: str, skip: set[str]) -> tuple[list[str], int]:
+    """Valid, unchecked names from a file, and how many lines were not valid names."""
+    names, invalid = [], 0
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        sys.exit(f"Could not read {path}: {e.strerror}")
+    seen: set[str] = set()
+    for line in lines:
+        name = line.strip().lower()
+        if not name:
+            continue
+        if not NAME_RE.match(name):
+            invalid += 1
+        elif name not in skip and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names, invalid
+
+
+# ---------------------------------------------------------------------------
+# Talking to Discord
+# ---------------------------------------------------------------------------
+
+
+async def check(session: aiohttp.ClientSession, name: str, proxy: str | None) -> tuple[str, float]:
+    """Returns (status, wait): status is 'free', 'taken', 'limited' or 'error'."""
+    try:
+        async with session.post(ENDPOINT, json={"username": name}, proxy=proxy) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and isinstance(data.get("taken"), bool):
+                    return ("taken" if data["taken"] else "free"), 0.0
+                return "error", 0.0
+            if resp.status == 429:
+                try:
+                    wait = float((await resp.json(content_type=None)).get("retry_after", 5))
+                except Exception:
+                    wait = float(resp.headers.get("Retry-After", 5) or 5)
+                return "limited", wait
+            return "error", 0.0
+    except Exception:
+        return "error", 0.0
+
+
+class Proxies:
+    """A list of proxies used one at a time; a proxy that keeps failing is dropped."""
+
+    def __init__(self, mode: str, items: list[str]):
+        self.mode, self.items, self.idx = mode, items, 0
+        self.strikes: dict[str, int] = {}
+        self.total = len(items)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.items)
+
+    def current(self) -> str | None:
+        return self.items[self.idx % len(self.items)] if self.items else None
+
+    def good(self, proxy: str | None) -> None:
+        if proxy:
+            self.strikes.pop(proxy, None)
+
+    def bad(self, proxy: str | None) -> bool:
+        """Count a failure and move on. Returns True if the proxy was dropped."""
+        if not self.items or proxy not in self.items:
+            return False
+        self.strikes[proxy] = self.strikes.get(proxy, 0) + 1
+        if self.strikes[proxy] >= MAX_STRIKES:
+            position = self.items.index(proxy)
+            self.items.remove(proxy)
+            self.strikes.pop(proxy, None)
+            if self.items:
+                self.idx = position % len(self.items)   # the next proxy slid into this slot
+            return True
+        self.idx = (self.idx + 1) % len(self.items)
+        return False
+
+
+async def scrape_free_proxies(session: aiohttp.ClientSession, say) -> list[str]:
+    say("Looking for working free proxies. This can take a few minutes and often finds very few.")
+    raw: set[str] = set()
+
+    async def fetch(url: str) -> None:
+        try:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    raw.update(p.strip() for p in (await resp.text()).splitlines() if PROXY_RE.match(p.strip()))
+        except Exception:
+            pass
+
+    await asyncio.gather(*(fetch(u) for u in PROXY_SOURCES))
+    sample = random.sample(sorted(raw), min(len(raw), FREE_PROXY_SAMPLE))
+    say(f"Found {len(raw)} candidates, testing {len(sample)} against Discord...")
+    sem, working, done = asyncio.Semaphore(200), [], 0
+
+    async def test(proxy: str) -> None:
+        nonlocal done
+        async with sem:
+            status, _ = await check(session, "aa", proxy)
+            if status == "taken":
+                working.append(proxy)
+            done += 1
+            if done % 500 == 0:
+                say(f"  tested {done}/{len(sample)}, {len(working)} working so far")
+
+    await asyncio.gather(*(test(p) for p in sample))
+    say(f"{len(working)} working proxies found.")
+    return working
+
+
+# ---------------------------------------------------------------------------
+# Live display
+# ---------------------------------------------------------------------------
+
+
+class Screen:
+    def __init__(self, verbose: bool):
+        self.verbose, self.width = verbose, 0
+
+    def say(self, text: str) -> None:
+        """Print a message on its own line."""
+        self.clear()
+        print(text, flush=True)
+
+    def debug(self, text: str) -> None:
+        if self.verbose:
+            self.say(f"  {text}")
+
+    def clear(self) -> None:
+        if self.width:
+            print("\r" + " " * self.width + "\r", end="", flush=True)
+            self.width = 0
+
+    def live(self, text: str) -> None:
+        pad = max(self.width - len(text), 0)
+        print("\r" + text + " " * pad, end="", flush=True)
+        self.width = len(text)
+
+
+async def notify(session: aiohttp.ClientSession, url: str, name: str) -> None:
+    payload = {"embeds": [{"title": "Username available", "description": f"**{name}** is free. Go claim it!",
+                           "color": 0x30D158, "footer": {"text": "Discord Username Checker"}}]}
+    for _ in range(2):
+        try:
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 429:
+                    return
+                await asyncio.sleep(float((await resp.json(content_type=None)).get("retry_after", 2)))
+        except Exception:
+            return
+
+
+# ---------------------------------------------------------------------------
+# The hunt
+# ---------------------------------------------------------------------------
+
+
+async def hunt(cfg: dict, screen: Screen, stats: dict) -> None:
+    delay = SPEEDS[cfg["speed"]]
+    checked = load_set(CHECKED_FILE)
+    skipped: set[str] = set()
+    screen.say(f"{len(checked):,} usernames already checked" + (" (resuming)" if checked else ""))
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12), trust_env=False) as session:
+        # --- proxies
+        pool = Proxies(cfg["proxies"], [])
+        if cfg["proxies"] == "file":
+            path = Path(cfg["proxy_file"])
+            items = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()
+                     if PROXY_RE.match(ln.strip())] if path.exists() else []
+            if not items:
+                screen.say(f"No usable proxies in {path}; continuing without proxies.")
+            pool = Proxies("file", items)
+        elif cfg["proxies"] == "free":
+            pool = Proxies("free", await scrape_free_proxies(session, screen.say))
+            if not pool.active:
+                screen.say("No working free proxies found; continuing without proxies (slower, but it works).")
+
+        screen.say(f"Running: {describe(cfg)}\nPress Ctrl+C any time to stop; progress is saved.\n")
+        started = time.monotonic()
+        waiting = 0.0
+        batch: list[str] = []
+
+        def refresh(last: str = "") -> None:
+            elapsed = time.monotonic() - started
+            rate = f"{stats['checked'] / (elapsed / 60):.0f}/min" if elapsed >= 10 else "--/min"
+            proxy_part = f" | proxies {len(pool.items)}/{pool.total}" if pool.total else ""
+            wait_part = f" | rate-limited, waiting {waiting:.0f}s" if waiting else ""
+            screen.live(f"  checked {stats['checked']:,} | free {stats['free']} | "
+                        f"{rate}{proxy_part}{wait_part} {last}")
+
+        while True:
+            if not batch:
+                if cfg["names_file"]:
+                    names, invalid = file_names(cfg["names_file"], checked | skipped)
+                    if invalid and not stats["note_invalid"]:
+                        stats["note_invalid"] = True
+                        screen.say(f"Ignoring {invalid} lines in {cfg['names_file']} that are not valid usernames.")
+                    batch = names[:500]
+                else:
+                    batch = gen_names(500, cfg["length"], cfg["kind"], checked | skipped)
+                if not batch:
+                    screen.say("No new usernames left to check. Done!")
+                    return
+
+            name = batch.pop()
+            attempt = 0
+            while True:
+                attempt += 1
+                proxy = pool.current()
+                status, wait = await check(session, name, proxy)
+                if status in ("free", "taken"):
+                    pool.good(proxy)
+                    break
+                stats["retries"] += 1
+                if pool.active:
+                    dropped = pool.bad(proxy)
+                    screen.debug(f"{status} via {proxy}" + (" (proxy dropped)" if dropped else ""))
+                    if not pool.active:
+                        screen.say("All proxies failed; continuing without proxies (slower).")
+                        attempt = 0   # a fresh start for this name, now on your own connection
+                    continue
+                if status == "limited":
+                    stats["limited"] += 1
+                    waiting = min(max(wait, 3.0), 60.0)
+                    while waiting > 0:
+                        refresh()
+                        await asyncio.sleep(1)
+                        waiting -= 1
+                    waiting = 0.0
+                else:
+                    await asyncio.sleep(min(2 * attempt, 10))
+                if attempt >= MAX_ATTEMPTS:
+                    status = "gave_up"
+                    break
+            if status == "gave_up":
+                # Never mark a name as checked when we could not get a real answer.
+                skipped.add(name)
+                stats["skipped"] += 1
+                screen.debug(f"gave up on {name} (no answer); it will not be marked as checked")
+                continue
+
+            checked.add(name)
+            append_line(CHECKED_FILE, name)
+            stats["checked"] += 1
+            if status == "free":
+                stats["free"] += 1
+                stats["hits"].append(name)
+                append_line(HITS_FILE, name)
+                screen.say("\n" + "*" * 46 + f"\n   AVAILABLE: {name}   (saved to hits.txt)\n" + "*" * 46 + "\n")
+                if cfg["webhook"]:
+                    await notify(session, cfg["webhook"], name)
+            refresh(f"| last: {name}")
+            await asyncio.sleep(delay)
+
+
+def summary(stats: dict, started: float) -> None:
+    mins = (time.monotonic() - started) / 60
+    print(f"\n\n--- Summary ---\n  Checked this session: {stats['checked']:,} in {mins:.1f} min")
+    print(f"  Free names found: {stats['free']}" + (f"  ->  {', '.join(stats['hits'])}" if stats["hits"] else ""))
+    if stats["free"]:
+        print(f"  (also saved in {HITS_FILE.name})")
+    if stats["skipped"]:
+        print(f"  Skipped {stats['skipped']} names Discord never answered for (they will be retried next run).")
+    if stats["limited"]:
+        print(f"  Rate-limited {stats['limited']} times; try the 'safe' speed or your own proxies.")
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Find available Discord usernames. Run with no options to start.")
+    ap.add_argument("--setup", action="store_true", help="answer a few simple questions and save your settings")
+    ap.add_argument("--length", type=int, choices=range(2, 7), metavar="2-6", help="username length")
+    ap.add_argument("--type", choices=list(KINDS), help="letters, digits, mix (both) or any")
+    ap.add_argument("--speed", choices=list(SPEEDS), help="safe (default), normal or fast")
+    ap.add_argument("--proxies", metavar="none|free|FILE", help="proxy mode or a file with one host:port per line")
+    ap.add_argument("--names", metavar="FILE", help="check names from a file instead of generating them")
+    ap.add_argument("--webhook", metavar="URL", help="Discord webhook to ping when a name is free")
+    ap.add_argument("--verbose", action="store_true", help="show detailed proxy and retry messages")
+    ap.add_argument("--reset", action="store_true", help="forget every checked username (asks first)")
+    return ap.parse_args()
+
+
+def settings_from(args: argparse.Namespace) -> dict:
+    if args.setup:
+        return wizard()
+    first_run = not CONFIG_FILE.exists()
+    cfg = load_config()
+    if first_run:
+        print("First run: starting with simple defaults. Run  python checker.py --setup  to change them.\n")
+    if args.length:
+        cfg["length"] = args.length
+    if args.type:
+        cfg["kind"] = args.type
+    if args.speed:
+        cfg["speed"] = args.speed
+    if args.names:
+        cfg["names_file"] = args.names
+    if args.webhook:
+        cfg["webhook"] = args.webhook
+    if args.proxies:
+        if args.proxies in ("none", "free"):
+            cfg["proxies"] = args.proxies
+        else:
+            cfg["proxies"], cfg["proxy_file"] = "file", args.proxies
+    if cfg["speed"] not in SPEEDS or cfg["kind"] not in KINDS:
+        cfg.update(speed="safe", kind="mix")
+    return cfg
+
+
+def main() -> None:
+    args = parse_args()
+    print(f"\n  Discord Username Checker v{VERSION}\n")
+    if args.reset:
+        if input(f"This forgets all {len(load_set(CHECKED_FILE)):,} checked names. Type YES to confirm: ").strip() == "YES":
+            CHECKED_FILE.unlink(missing_ok=True)
+            print("Done.")
+        else:
+            print("Cancelled; nothing changed.")
+        return
+    cfg = settings_from(args)
+    stats = {"checked": 0, "free": 0, "hits": [], "limited": 0, "retries": 0, "skipped": 0, "note_invalid": False}
+    screen, started = Screen(args.verbose), time.monotonic()
+    try:
+        asyncio.run(hunt(cfg, screen, stats))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        screen.clear()
+        summary(stats, started)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nstopped. progress saved — run again to resume.")
+    main()

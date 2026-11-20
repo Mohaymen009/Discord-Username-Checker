@@ -1,124 +1,95 @@
-# ☁️ Discord Username Checker
+# Discord Username Checker
 
-Tokenless Discord username availability hunter. Finds free usernames by checking
-Discord's public unique-username endpoint — **no token, no login, no captcha**.
+Find available Discord usernames. No token, no login, no captcha.
 
-> Built around hunting short (3–4 char) usernames. Pure-letter short names are
-> effectively all taken, so the default generator targets 4-character mixes with
-> at least one digit — where the actually-available names still live.
+## Quick start
 
-## ✨ Features
-
-- **Tokenless** — uses Discord's public `username-attempt-unauthed` endpoint
-- **Interactive wizard** — proxies, username style, webhooks, pacing
-- **Resume support** — remembers every checked username in `checked.txt`;
-  never checks the same name twice, even across restarts
-- **Sticky proxy rotation** — rides one proxy until it's rate-limited, then
-  moves to the next, round-robin back to the first after the last
-- **Free proxy scraper** — pulls from multiple public lists and **validates
-  each proxy against Discord before using it** (typically only ~0.1% pass)
-- **Embed reports** — every check (success *and* fail) can be streamed to
-  Discord webhooks as color-coded embeds, with the proxy used
-- **Persistent config** — settings saved to `config.json`, reused next run
-
-## 🚀 Quick start
-
-```bash
-pip install aiohttp
-python checker.py
-```
-
-The wizard walks you through everything:
+1. Install [Python](https://www.python.org/downloads/) (on Windows, tick **Add Python to PATH**).
+2. Download this repo and **double-click `run.bat`** (Windows) or run `./run.sh` (Linux/macOS).
+3. That's it. It starts checking right away. When it finds a free name you'll see:
 
 ```
-— checked usernames —
-  * y) continue from where we left off (recommended)
-    n) start over (wipes checked.txt)
-
-— proxies —
-  * 1) scrape free proxies + auto-validate (no setup)
-    2) load from my own file (one host:port per line)
-    3) no proxies (your own IP — expect rate limits)
-  keep hunting for fresh proxies in the background while checking?
-  * y) yes — auto-refresh the proxy pool every 10 min
-    n) no — use only the starting pool
-
-— usernames —
-  username length (2-5 — Discord's minimum is 2; shorter = nearly all taken) [4]:
-  what should the usernames be made of?
-  * 1) all letters (e.g. qwer)
-    2) all numbers (e.g. 1337)
-    3) any mix of letters and digits, at least one of each (e.g. a1b2)
-    4) mix with exactly 1 letter, rest digits (e.g. 1a23)
-    5) mix with exactly 1 digit, rest letters (e.g. ab1c)
-    6) anything (letters, digits, any combination)
-
-— webhooks —
-  * 1) success only (free usernames)
-    2) fails only (taken usernames)
-    3) both — separate success and fail webhooks
-    4) single webhook for everything
-    5) no webhooks (console only)
+**********************************************
+   AVAILABLE: a1b2   (saved to hits.txt)
+**********************************************
 ```
 
-## 📁 Files
+Press **Ctrl+C** any time to stop. You get a summary, and progress is saved, so the next run
+picks up where you left off and never re-checks a name.
 
-| File | Purpose |
-|------|---------|
-| `checker.py` | the whole tool |
-| `config.json` | saved wizard settings (auto-created) |
-| `checked.txt` | every username ever checked — resume data |
-| `hits.txt` | available usernames found |
-| `proxies.txt` | validated proxy cache (auto-created) |
+On the first run it uses simple defaults: 4-character names (letters and numbers mixed), a
+safe speed, no proxies. You don't need to answer any questions.
 
-## 🌐 Proxy modes
+## Change the settings
 
-| Mode | Speed | Notes |
-|------|-------|-------|
-| Free scrape + validate | slow but free | ~1 in 1000 free proxies actually works |
-| Your own proxies | best | one `host:port` per line |
-| No proxies (own IP) | ~1 check / 1.5s | Discord rate-limits quickly |
+```
+python checker.py --setup
+```
 
-Free proxies are validated by making a real availability request through each
-one — only proxies that answer correctly enter rotation.
+Four plain questions: what kind of names, how fast, proxies or not, and an optional
+Discord webhook to ping you when a name is free. Your answers are saved, so afterwards you
+just run it normally.
 
-## 🔄 Background proxy refresher
+Prefer options? Everything has a flag:
 
-Answer **yes** to "keep hunting for fresh proxies" and the checker spawns a
-background task that, every 10 minutes, re-scrapes the public proxy lists,
-validates the newcomers against Discord, and merges survivors straight into
-the live rotation (and `proxies.txt`). Dead pools refill themselves while you
-keep checking — no restart needed.
+| Flag | What it does |
+|------|--------------|
+| `--length 3` | username length, 2 to 6 |
+| `--type letters` | `letters`, `digits`, `mix` (both) or `any` |
+| `--speed normal` | `safe` (default, 1 check / 2s), `normal` (1.2s) or `fast` (0.6s) |
+| `--names file.txt` | check names from your own file, one per line |
+| `--proxies none\|free\|FILE` | no proxies (default), free public ones, or your own file |
+| `--webhook URL` | ping a Discord webhook when a name is free |
+| `--verbose` | show detailed retry and proxy messages |
+| `--reset` | forget every checked name (asks you to type YES first) |
 
-## 📡 Webhook embeds
+## What you see
 
-Every check can be reported:
+One live line that updates in place:
 
-- ✅ **green** — username is available
-- ❌ **red** — username is taken
-- 🟠 **orange** — notices (proxy switched, errors)
+```
+  checked 1,234 | free 2 | 28/min | last: ab12
+```
 
-Embeds include the username, the proxy used, and a timestamp. Sends are
-throttled to stay under Discord's webhook rate limit (5 msg / 2 s).
+If Discord slows you down it says so and waits ("rate-limited, waiting 5s"), then carries on.
 
-## ⚙️ How the checker works
+## Good to know
 
-Discord exposes an unauthenticated endpoint used by their signup page:
+- **Short names are nearly all taken.** 3-letter names are almost gone. Mixed letter/number
+  names (the default) are where free ones still turn up.
+- **Speed vs. getting blocked.** Safe speed is the least likely to be rate-limited. Going
+  faster works best with your own proxies.
+- **Proxies are optional.** Free public proxies are slow to set up and mostly don't work, so
+  they're off by default. If every proxy fails, the tool tells you and keeps going without them.
+- **A name is only marked as checked when Discord actually answered.** If Discord is
+  unreachable or errors, the name is retried (or skipped and tried again next run), never lost.
+- It can't claim names for you. When it finds a free one, you go claim it yourself.
+
+## Files it creates
+
+| File | What it is |
+|------|------------|
+| `checked.txt` | every name checked so far (so it can resume) |
+| `hits.txt` | the free names it found |
+| `config.json` | your saved settings (may contain a webhook URL, kept out of git) |
+| `proxies.txt` | your own proxy list, if you use one |
+
+## How it works
+
+Discord's sign-up page asks an unauthenticated endpoint whether a username is taken:
 
 ```
 POST https://discord.com/api/v9/unique-username/username-attempt-unauthed
 {"username": "candidate"}   ->   {"taken": true|false}
 ```
 
-That's it — no account needed. The tool never logs in, never touches any
-account, and can't claim names for you; when it finds a free one, **you** go
-claim it.
+The tool just asks that question for lots of names, politely.
 
-## ⚠️ Disclaimer
+## Disclaimer
 
-For educational purposes. Don't hammer Discord's API — the default 1.5s delay
-exists for a reason. Respect rate limits and use responsibly.
+For educational purposes. Don't hammer Discord's API; the default pace exists for a reason.
+Respect rate limits and use responsibly.
 
-## 📄 License
+## License
 
 MIT
